@@ -4,14 +4,17 @@
 //! (`#/$defs/...`, `#/definitions/...`, or any JSON pointer), `allOf`, `anyOf`,
 //! `oneOf`, `not`. Validation: `type`, `enum`, `const`, `properties`,
 //! `required`, `additionalProperties`, `items`, `minItems`, `maxItems`,
-//! `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`,
-//! `exclusiveMaximum`. Every other keyword is ignored, as the specification
-//! requires of an unknown one; `pattern` and `format` are among them until a
-//! regular-expression contract exists to lean on.
+//! `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`,
+//! `exclusiveMinimum`, `exclusiveMaximum`, and `format` for `date`, `time`,
+//! `date-time`, `email`, `uri`, `ipv4`, `ipv6`, `uuid` and `regex` — an
+//! assertion here, not an annotation, because a Location that names a format
+//! means it. Every other keyword and format is ignored, as the specification
+//! requires of an unknown one.
 //!
 //! An issue's `code` is the keyword that failed and its `path` the JSON pointer
 //! of the instance location, so an operator reads `/lines/0/qty: minimum`.
 
+use crate::format::{compiled, holds_format};
 use contract::ValidationIssue;
 use serde_json::{Map, Value};
 
@@ -253,6 +256,22 @@ fn check_string(
             path,
         ));
     }
+    if let Some(pattern) = keywords.get("pattern").and_then(Value::as_str) {
+        match compiled(pattern) {
+            Some(regex) if regex.is_match(text) => {}
+            Some(_) => out.push(issue("pattern", "does not match the pattern", path)),
+            None => out.push(issue(
+                "pattern",
+                &format!("{pattern:?} is not a pattern"),
+                path,
+            )),
+        }
+    }
+    if let Some(format) = keywords.get("format").and_then(Value::as_str)
+        && !holds_format(format, text)
+    {
+        out.push(issue("format", &format!("is not a {format}"), path));
+    }
 }
 
 fn check_number(
@@ -393,5 +412,31 @@ mod tests {
         let schema = json!({ "properties": { "a/b": { "type": "null" } } });
         let issues = check(&schema, &schema, &json!({"a/b": 1}), "");
         assert_eq!(issues[0].path.as_deref(), Some("/a~1b"));
+    }
+
+    #[test]
+    fn a_pattern_is_an_unanchored_search_and_a_bad_one_is_named() {
+        let schema = json!({ "pattern": "[A-Z]{2}\\d{4}" });
+        assert!(codes(&schema, &json!("ref SE1234 ok")).is_empty());
+        assert_eq!(codes(&schema, &json!("se1234")), ["pattern"]);
+        let broken = json!({ "pattern": "(" });
+        let issues = check(&broken, &broken, &json!("x"), "");
+        assert!(issues[0].message.contains("is not a pattern"));
+    }
+
+    #[test]
+    fn formats_are_asserted_not_annotated() {
+        let of = |format: &str| json!({ "format": format });
+        assert!(codes(&of("date"), &json!("2026-09-07")).is_empty());
+        assert_eq!(codes(&of("date"), &json!("2026-13-07")), ["format"]);
+        assert!(codes(&of("date-time"), &json!("2026-09-07T13:45:00+02:00")).is_empty());
+        assert!(codes(&of("email"), &json!("ilian@example.se")).is_empty());
+        assert_eq!(codes(&of("email"), &json!("nobody")), ["format"]);
+        assert!(codes(&of("uri"), &json!("xmip:///playground")).is_empty());
+        assert!(codes(&of("ipv6"), &json!("::1")).is_empty());
+        assert!(codes(&of("uuid"), &json!("0192b6d4-7c3e-7f3a-9b2a-3d4e5f6a7b8c")).is_empty());
+        assert_eq!(codes(&of("uuid"), &json!("not-a-uuid")), ["format"]);
+        assert_eq!(codes(&of("regex"), &json!("(")), ["format"]);
+        assert!(codes(&of("hostname-we-do-not-check"), &json!("anything")).is_empty());
     }
 }

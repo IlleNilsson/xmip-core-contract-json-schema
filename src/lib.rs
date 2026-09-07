@@ -12,6 +12,7 @@
 //! [`schema`] documents; anything outside it is ignored, as the specification
 //! says an unknown keyword must be.
 
+pub mod format;
 pub mod schema;
 
 use contract::{
