@@ -106,10 +106,7 @@ impl Contract for JsonSchema {
             Some(schema) => schema::check(schema, schema, &instance, ""),
             None => Vec::new(),
         };
-        Ok(ValidationResult {
-            valid: issues.is_empty(),
-            issues,
-        })
+        Ok(ValidationResult::of(issues))
     }
 }
 
@@ -119,14 +116,11 @@ fn is_json_media_type(media_type: &str) -> bool {
 }
 
 fn malformed(error: &serde_json::Error) -> ValidationResult {
-    ValidationResult {
-        valid: false,
-        issues: vec![ValidationIssue {
-            code: "malformed".to_string(),
-            message: format!("not valid JSON: {error}"),
-            path: Some(format!("line {} column {}", error.line(), error.column())),
-        }],
-    }
+    ValidationResult::of(vec![ValidationIssue::at(
+        "malformed",
+        &format!("not valid JSON: {error}"),
+        &format!("line {} column {}", error.line(), error.column()),
+    )])
 }
 
 /// Loads the contract a Location names: an empty reference is the bare
@@ -155,16 +149,8 @@ impl ContractFactory for JsonSchemaFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use contract::fixture::stream_as as stream;
     use serde_json::json;
-    use xcore::StreamId;
-
-    fn stream(text: &str, media_type: Option<&str>) -> Stream {
-        Stream::new(
-            StreamId::new(1),
-            text.as_bytes().to_vec(),
-            media_type.map(str::to_string),
-        )
-    }
 
     fn order_schema() -> Value {
         json!({
