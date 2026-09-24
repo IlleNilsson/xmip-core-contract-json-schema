@@ -15,7 +15,7 @@
 //! of the instance location, so an operator reads `/lines/0/qty: minimum`.
 
 use crate::format::{compiled, holds_format};
-use sdk::contract::ValidationIssue;
+use contract::ValidationIssue;
 use serde_json::{Map, Value};
 
 /// Evaluate `instance` at `path` against `schema`, resolving `$ref` in `root`.
