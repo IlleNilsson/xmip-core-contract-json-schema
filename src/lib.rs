@@ -15,7 +15,7 @@
 pub mod format;
 pub mod schema;
 
-use contract::{
+use sdk::contract::{
     Contract, ContractDescriptor, ContractError, ContractFactory, ContractId, ValidationIssue,
     ValidationResult,
 };
