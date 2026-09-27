@@ -1,79 +1,76 @@
-//! The `pattern` and `format` checks of the string vocabulary.
+//! The `format` values this contract asserts.
 //!
-//! A pattern compiles once per process and is an unanchored search, as JSON
-//! Schema says. A format is asserted, not annotated: a Location that names one
-//! means it. Formats this file does not know hold, as the specification says
-//! an unknown format must.
+//! A format is asserted, not annotated: a Location that names one means it.
+//! A format this file does not know holds, as the specification says an
+//! unknown format must, so it is not compiled at all. Dates and times are
+//! RFC 3339's, read by the estate's one calendar (`codec::civil`), so the
+//! thirty-first of February is no date.
 
+use codec::civil;
 use regex::Regex;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
-/// A pattern compiles once per process. JSON Schema patterns are unanchored
-/// searches, so the text is used as written.
-pub(crate) fn compiled(pattern: &str) -> Option<Regex> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<Regex>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache
-        .entry(pattern.to_string())
-        .or_insert_with(|| Regex::new(pattern).ok())
-        .clone()
+/// A format this contract checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Format {
+    /// RFC 3339 `full-date`.
+    Date,
+    /// RFC 3339 `full-time`: a time of day and its offset.
+    Time,
+    /// RFC 3339 `date-time`.
+    DateTime,
+    Email,
+    Uri,
+    Ipv4,
+    Ipv6,
+    Uuid,
+    Regex,
 }
 
-pub(crate) fn holds_format(format: &str, text: &str) -> bool {
-    match format {
-        "date" => is_date(text),
-        "time" => is_time(text),
-        "date-time" => text
-            .split_once(['T', 't'])
-            .is_some_and(|(date, time)| is_date(date) && is_time(time)),
-        "email" => text.split_once('@').is_some_and(|(local, domain)| {
-            !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
-        }),
-        "uri" => text.split_once(':').is_some_and(|(scheme, rest)| {
-            !rest.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-        }),
-        "ipv4" => text.parse::<std::net::Ipv4Addr>().is_ok(),
-        "ipv6" => text.parse::<std::net::Ipv6Addr>().is_ok(),
-        "uuid" => {
-            let parts: Vec<&str> = text.split('-').collect();
-            parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
-                && text.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
-        }
-        "regex" => Regex::new(text).is_ok(),
-        _ => true,
-    }
-}
-
-fn is_date(text: &str) -> bool {
-    let parts: Vec<&str> = text.split('-').collect();
-    parts.len() == 3
-        && parts[0].len() == 4
-        && parts[1].len() == 2
-        && parts[2].len() == 2
-        && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit()))
-        && (1..=12).contains(&parts[1].parse::<u8>().unwrap_or(0))
-        && (1..=31).contains(&parts[2].parse::<u8>().unwrap_or(0))
-}
-
-fn is_time(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() >= 8
-        && bytes[..8].iter().enumerate().all(|(i, b)| {
-            if i == 2 || i == 5 {
-                *b == b':'
-            } else {
-                b.is_ascii_digit()
-            }
+impl Format {
+    /// The format `name` names, when it is one this contract checks.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "date" => Self::Date,
+            "time" => Self::Time,
+            "date-time" => Self::DateTime,
+            "email" => Self::Email,
+            "uri" => Self::Uri,
+            "ipv4" => Self::Ipv4,
+            "ipv6" => Self::Ipv6,
+            "uuid" => Self::Uuid,
+            "regex" => Self::Regex,
+            _ => return None,
         })
-        && text[8..]
-            .chars()
-            .all(|c| c.is_ascii_digit() || "Zz+-:.".contains(c))
+    }
+
+    /// Whether `text` is of this format.
+    #[must_use]
+    pub fn holds(self, text: &str) -> bool {
+        match self {
+            Self::Date => civil::read_date(text).is_some(),
+            Self::Time => civil::read_time(text)
+                .and_then(|(_, zone)| civil::read_offset(zone))
+                .is_some(),
+            Self::DateTime => civil::read_rfc3339(text).is_some(),
+            Self::Email => text.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty() && domain.contains('.') && !domain.ends_with('.')
+            }),
+            Self::Uri => text.split_once(':').is_some_and(|(scheme, rest)| {
+                !rest.is_empty()
+                    && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+            }),
+            Self::Ipv4 => text.parse::<std::net::Ipv4Addr>().is_ok(),
+            Self::Ipv6 => text.parse::<std::net::Ipv6Addr>().is_ok(),
+            Self::Uuid => {
+                text.split('-').map(str::len).eq([8, 4, 4, 4, 12])
+                    && text.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+            }
+            // The instance is itself a pattern: compiling it is the check.
+            Self::Regex => Regex::new(text).is_ok(),
+        }
+    }
 }
