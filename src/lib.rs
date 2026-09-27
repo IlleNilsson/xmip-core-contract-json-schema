@@ -21,6 +21,7 @@ use contract::{
 };
 use serde_json::Value;
 use stream::Stream;
+use xcore::settings::{Applies, Kind, Presence, Setting, Settings};
 
 /// The JSON contract, bare or bound to a schema.
 pub struct JsonSchema {
@@ -132,6 +133,10 @@ impl ContractFactory for JsonSchemaFactory {
         "json-schema"
     }
 
+    fn settings(&self) -> &'static Settings {
+        SETTINGS
+    }
+
     fn load(&self, reference: &str) -> Result<Box<dyn Contract>, ContractError> {
         if reference.trim().is_empty() {
             return Ok(Box::new(JsonSchema::new()));
@@ -145,6 +150,18 @@ impl ContractFactory for JsonSchemaFactory {
         Ok(Box::new(JsonSchema::with_schema(schema)?))
     }
 }
+
+/// What a Location gives this contract (ADR-0064, amendment 2026-09-26).
+const SETTINGS: &Settings = &Settings {
+    technology: env!("CARGO_PKG_NAME"),
+    settings: &[Setting {
+        name: "reference",
+        kind: Kind::Address,
+        presence: Presence::Optional,
+        meaning: "The path of the JSON Schema documents are held to; left out, any JSON holds.",
+        applies: Applies::Both,
+    }],
+};
 
 #[cfg(test)]
 mod tests {
@@ -264,6 +281,39 @@ mod tests {
             factory
                 .load(dir.join("missing.json").to_str().expect("path"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn json_schema_declares_its_settings_and_reads_through_them() {
+        assert!(SETTINGS.problems().is_empty(), "{:?}", SETTINGS.problems());
+        let given = |name: &str, value: &str| {
+            (
+                name.to_string(),
+                xcore::settings::Given::Text(value.to_string()),
+            )
+        };
+        assert!(JsonSchemaFactory.open(Applies::Both, &[]).is_ok(), "bare");
+        let unread = JsonSchemaFactory
+            .open(
+                Applies::Receive,
+                &[given("reference", "/no/such/order.json")],
+            )
+            .err()
+            .expect("an unread file is refused");
+        assert!(
+            unread.message.contains("/no/such/order.json"),
+            "{}",
+            unread.message
+        );
+        let refused = JsonSchemaFactory
+            .open(Applies::Send, &[given("unheard_of", "x")])
+            .err()
+            .expect("an unknown setting is refused");
+        assert!(
+            refused.message.contains("unheard_of"),
+            "{}",
+            refused.message
         );
     }
 }
