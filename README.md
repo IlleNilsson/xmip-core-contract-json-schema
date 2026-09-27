@@ -11,7 +11,13 @@ and each departure is reported with the JSON pointer of where it happened and th
 keyword that refused it.
 
 `src/schema.rs` lists the JSON Schema vocabulary evaluated. Unknown keywords are
-ignored, as the specification requires.
+ignored, as the specification requires. A schema is compiled once, when it is
+bound — every keyword read, every `$ref` resolved, every `pattern` compiled — and
+a Stream is held to that tree (`src/check.rs`) without reading the schema again.
+The pointer is RFC 6901's, the empty pointer for the whole document, and is
+spelled only for an issue raised. `date`, `time` and `date-time` are RFC 3339's,
+read by the estate's one calendar, `codec::civil`: the thirty-first of February
+is no date. The TOON contract holds its documents to the same compiled schema.
 
 ## Toolchain
 

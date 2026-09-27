@@ -1,367 +1,224 @@
-//! The JSON Schema vocabulary this contract evaluates.
+//! The JSON Schema vocabulary this contract evaluates, compiled once when a
+//! schema is bound.
 //!
 //! Core: boolean schemas, `$ref` to a location inside the same document
-//! (`#/$defs/...`, `#/definitions/...`, or any JSON pointer), `allOf`, `anyOf`,
-//! `oneOf`, `not`. Validation: `type`, `enum`, `const`, `properties`,
-//! `required`, `additionalProperties`, `items`, `minItems`, `maxItems`,
-//! `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`,
-//! `exclusiveMinimum`, `exclusiveMaximum`, and `format` for `date`, `time`,
-//! `date-time`, `email`, `uri`, `ipv4`, `ipv6`, `uuid` and `regex` — an
-//! assertion here, not an annotation, because a Location that names a format
-//! means it. Every other keyword and format is ignored, as the specification
-//! requires of an unknown one.
+//! (`#/$defs/...`, `#/definitions/...`, or any JSON pointer, percent-decoded
+//! as a URI fragment is), `allOf`, `anyOf`, `oneOf`, `not`. Validation:
+//! `type`, `enum`, `const`, `properties`, `required`, `additionalProperties`,
+//! `items`, `minItems`, `maxItems`, `minLength`, `maxLength`, `pattern`,
+//! `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, and
+//! `format` for `date`, `time`, `date-time`, `email`, `uri`, `ipv4`, `ipv6`,
+//! `uuid` and `regex` — an assertion here, not an annotation, because a
+//! Location that names a format means it. Every other keyword and format is
+//! ignored, as the specification requires of an unknown one.
 //!
-//! An issue's `code` is the keyword that failed and its `path` the JSON pointer
-//! of the instance location, so an operator reads `/lines/0/qty: minimum`.
+//! The schema is read once, into a tree of [`Node`]s: every keyword looked up,
+//! every `$ref` resolved, every `pattern` compiled to its automaton. A
+//! Stream is then held to the tree ([`crate::check`]) without reading the
+//! schema document again.
 
-use crate::format::{compiled, holds_format};
-use contract::ValidationIssue;
+use crate::format::Format;
+use contract::ContractError;
+use regex::Regex;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
-/// Evaluate `instance` at `path` against `schema`, resolving `$ref` in `root`.
-#[must_use]
-pub fn check(root: &Value, schema: &Value, instance: &Value, path: &str) -> Vec<ValidationIssue> {
-    let mut issues = Vec::new();
-    let keywords = match schema {
-        Value::Bool(false) => {
-            issues.push(issue("false", "nothing is allowed here", path));
-            return issues;
-        }
-        Value::Object(keywords) => keywords,
-        // `true`, and anything that is not a schema at all, admits everything.
-        _ => return issues,
-    };
-
-    if let Some(reference) = keywords.get("$ref").and_then(Value::as_str) {
-        match resolve(root, reference) {
-            Some(target) => issues.extend(check(root, target, instance, path)),
-            None => issues.push(issue("$ref", &format!("unresolvable {reference}"), path)),
-        }
-    }
-
-    check_type(keywords, instance, path, &mut issues);
-    check_values(keywords, instance, path, &mut issues);
-    check_object(root, keywords, instance, path, &mut issues);
-    check_array(root, keywords, instance, path, &mut issues);
-    check_string(keywords, instance, path, &mut issues);
-    check_number(keywords, instance, path, &mut issues);
-    check_composition(root, keywords, instance, path, &mut issues);
-    issues
+/// A bound JSON Schema, compiled.
+#[derive(Debug)]
+pub struct Schema {
+    pub(crate) nodes: Vec<Node>,
+    name: String,
 }
 
-fn issue(code: &str, message: &str, path: &str) -> ValidationIssue {
-    ValidationIssue {
-        code: code.to_string(),
-        message: message.to_string(),
-        path: Some(if path.is_empty() {
-            "/".to_string()
-        } else {
-            path.to_string()
-        }),
-    }
+/// One schema in the tree; the root is node 0.
+#[derive(Debug)]
+pub(crate) enum Node {
+    /// `true`, or anything that is not a schema at all: admits everything.
+    Any,
+    /// `false`: admits nothing.
+    Nothing,
+    Keywords(Box<Keywords>),
 }
 
-fn resolve<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
-    let pointer = reference.strip_prefix('#')?;
-    if pointer.is_empty() {
-        return Some(root);
-    }
-    let unescaped = pointer
-        .replace("%25", "%")
-        .replace("%7B", "{")
-        .replace("%7D", "}");
-    root.pointer(&unescaped)
+/// The keywords one schema object carries, each read once.
+#[derive(Debug, Default)]
+pub(crate) struct Keywords {
+    /// The node `$ref` lands on, or the reference that does not land.
+    pub reference: Option<Result<usize, String>>,
+    /// The type names `type` allows, and how a message lists them.
+    pub types: Option<(Vec<String>, String)>,
+    pub enumeration: Option<Vec<Value>>,
+    pub constant: Option<Value>,
+    pub required: Vec<String>,
+    pub properties: HashMap<String, usize>,
+    pub additional: Additional,
+    pub items: Option<usize>,
+    pub min_items: Option<u64>,
+    pub max_items: Option<u64>,
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    /// The compiled `pattern`, or the text that is not a pattern.
+    pub pattern: Option<Result<Regex, String>>,
+    /// A `format` this contract asserts, and its name.
+    pub format: Option<(Format, String)>,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub exclusive_minimum: Option<f64>,
+    pub exclusive_maximum: Option<f64>,
+    pub all_of: Vec<usize>,
+    pub any_of: Vec<usize>,
+    pub one_of: Vec<usize>,
+    pub not: Option<usize>,
 }
 
-fn type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+/// What `additionalProperties` says of a member `properties` does not name.
+#[derive(Debug, Default)]
+pub(crate) enum Additional {
+    #[default]
+    Allowed,
+    Forbidden,
+    Schema(usize),
 }
 
-fn is_integer(value: &Value) -> bool {
-    match value {
-        Value::Number(number) => {
-            number.is_i64() || number.is_u64() || number.as_f64().is_some_and(|f| f.fract() == 0.0)
-        }
-        _ => false,
-    }
-}
-
-fn has_type(instance: &Value, wanted: &str) -> bool {
-    match wanted {
-        "integer" => is_integer(instance),
-        "number" => instance.is_number(),
-        other => type_name(instance) == other,
-    }
-}
-
-fn check_type(
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    let Some(wanted) = keywords.get("type") else {
-        return;
-    };
-    let allowed: Vec<&str> = match wanted {
-        Value::String(one) => vec![one.as_str()],
-        Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
-        _ => return,
-    };
-    if !allowed.iter().any(|name| has_type(instance, name)) {
-        let message = format!(
-            "is {}, expected {}",
-            type_name(instance),
-            allowed.join(" or ")
-        );
-        out.push(issue("type", &message, path));
-    }
-}
-
-fn check_values(
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    if let Some(Value::Array(allowed)) = keywords.get("enum")
-        && !allowed.contains(instance)
-    {
-        out.push(issue("enum", "is not one of the allowed values", path));
-    }
-    if let Some(expected) = keywords.get("const")
-        && expected != instance
-    {
-        out.push(issue("const", &format!("must be {expected}"), path));
-    }
-}
-
-fn check_object(
-    root: &Value,
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    let Value::Object(members) = instance else {
-        return;
-    };
-    let properties = keywords.get("properties").and_then(Value::as_object);
-
-    if let Some(Value::Array(required)) = keywords.get("required") {
-        for name in required.iter().filter_map(Value::as_str) {
-            if !members.contains_key(name) {
-                out.push(issue(
-                    "required",
-                    &format!("missing property {name}"),
-                    &child(path, name),
-                ));
-            }
-        }
-    }
-
-    for (name, value) in members {
-        let member_path = child(path, name);
-        match properties.and_then(|p| p.get(name)) {
-            Some(subschema) => out.extend(check(root, subschema, value, &member_path)),
-            None => match keywords.get("additionalProperties") {
-                Some(Value::Bool(false)) => {
-                    out.push(issue(
-                        "additionalProperties",
-                        "is not a declared property",
-                        &member_path,
-                    ));
-                }
-                Some(subschema @ Value::Object(_)) => {
-                    out.extend(check(root, subschema, value, &member_path));
-                }
-                _ => {}
-            },
-        }
-    }
-}
-
-fn check_array(
-    root: &Value,
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    let Value::Array(items) = instance else {
-        return;
-    };
-    if let Some(min) = keywords.get("minItems").and_then(Value::as_u64)
-        && (items.len() as u64) < min
-    {
-        out.push(issue(
-            "minItems",
-            &format!("has {} items, at least {min} required", items.len()),
-            path,
-        ));
-    }
-    if let Some(max) = keywords.get("maxItems").and_then(Value::as_u64)
-        && (items.len() as u64) > max
-    {
-        out.push(issue(
-            "maxItems",
-            &format!("has {} items, at most {max} allowed", items.len()),
-            path,
-        ));
-    }
-    if let Some(subschema) = keywords.get("items") {
-        for (index, item) in items.iter().enumerate() {
-            out.extend(check(
-                root,
-                subschema,
-                item,
-                &child(path, &index.to_string()),
+impl Schema {
+    /// Compile `document` as a JSON Schema.
+    ///
+    /// # Errors
+    /// The document must itself be a JSON Schema: an object or a boolean.
+    pub fn compile(document: &Value) -> Result<Self, ContractError> {
+        if !(document.is_object() || document.is_boolean()) {
+            return Err(ContractError::new(
+                "a JSON Schema is an object or a boolean",
             ));
         }
+        let name = document
+            .get("$id")
+            .or_else(|| document.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("bound")
+            .to_string();
+        let mut compiler = Compiler {
+            root: document,
+            nodes: Vec::new(),
+            seen: HashMap::new(),
+        };
+        compiler.node(document);
+        Ok(Self {
+            nodes: compiler.nodes,
+            name,
+        })
+    }
+
+    /// The schema's `$id`, else its `title`, else `bound`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
-fn check_string(
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    let Value::String(text) = instance else {
-        return;
-    };
-    let length = text.chars().count() as u64;
-    if let Some(min) = keywords.get("minLength").and_then(Value::as_u64)
-        && length < min
-    {
-        out.push(issue(
-            "minLength",
-            &format!("is {length} characters, at least {min} required"),
-            path,
-        ));
-    }
-    if let Some(max) = keywords.get("maxLength").and_then(Value::as_u64)
-        && length > max
-    {
-        out.push(issue(
-            "maxLength",
-            &format!("is {length} characters, at most {max} allowed"),
-            path,
-        ));
-    }
-    if let Some(pattern) = keywords.get("pattern").and_then(Value::as_str) {
-        match compiled(pattern) {
-            Some(regex) if regex.is_match(text) => {}
-            Some(_) => out.push(issue("pattern", "does not match the pattern", path)),
-            None => out.push(issue(
-                "pattern",
-                &format!("{pattern:?} is not a pattern"),
-                path,
-            )),
+/// Compiles each schema object once, however many `$ref`s reach it, so a
+/// recursive schema is a cycle in the tree rather than an endless one.
+struct Compiler<'a> {
+    root: &'a Value,
+    nodes: Vec<Node>,
+    seen: HashMap<*const Value, usize>,
+}
+
+impl<'a> Compiler<'a> {
+    fn node(&mut self, schema: &'a Value) -> usize {
+        if let Some(&id) = self.seen.get(&std::ptr::from_ref(schema)) {
+            return id;
         }
+        let id = self.nodes.len();
+        self.seen.insert(std::ptr::from_ref(schema), id);
+        self.nodes.push(Node::Any);
+        let node = match schema {
+            Value::Bool(false) => Node::Nothing,
+            Value::Object(keywords) => Node::Keywords(Box::new(self.keywords(keywords))),
+            _ => Node::Any,
+        };
+        self.nodes[id] = node;
+        id
     }
-    if let Some(format) = keywords.get("format").and_then(Value::as_str)
-        && !holds_format(format, text)
-    {
-        out.push(issue("format", &format!("is not a {format}"), path));
-    }
-}
 
-fn check_number(
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    let Some(number) = instance.as_f64() else {
-        return;
-    };
-    let bound = |name: &str| keywords.get(name).and_then(Value::as_f64);
-    if bound("minimum").is_some_and(|min| number < min) {
-        out.push(issue(
-            "minimum",
-            &format!("{number} is below the minimum"),
-            path,
-        ));
+    fn keywords(&mut self, keywords: &'a Map<String, Value>) -> Keywords {
+        let number = |name: &str| keywords.get(name).and_then(Value::as_f64);
+        let count = |name: &str| keywords.get(name).and_then(Value::as_u64);
+        let mut compiled = Keywords {
+            enumeration: keywords.get("enum").and_then(Value::as_array).cloned(),
+            constant: keywords.get("const").cloned(),
+            min_items: count("minItems"),
+            max_items: count("maxItems"),
+            min_length: count("minLength"),
+            max_length: count("maxLength"),
+            minimum: number("minimum"),
+            maximum: number("maximum"),
+            exclusive_minimum: number("exclusiveMinimum"),
+            exclusive_maximum: number("exclusiveMaximum"),
+            ..Keywords::default()
+        };
+        if let Some(reference) = keywords.get("$ref").and_then(Value::as_str) {
+            compiled.reference = Some(
+                contract::reference::resolve(self.root, reference)
+                    .map(|target| self.node(target))
+                    .ok_or_else(|| reference.to_string()),
+            );
+        }
+        compiled.types = match keywords.get("type") {
+            Some(Value::String(one)) => Some(vec![one.clone()]),
+            Some(Value::Array(many)) => Some(
+                many.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            _ => None,
+        }
+        .map(|allowed: Vec<String>| {
+            let listed = allowed.join(" or ");
+            (allowed, listed)
+        });
+        if let Some(Value::Array(required)) = keywords.get("required") {
+            compiled.required = required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(properties) = keywords.get("properties").and_then(Value::as_object) {
+            for (name, schema) in properties {
+                let id = self.node(schema);
+                compiled.properties.insert(name.clone(), id);
+            }
+        }
+        compiled.additional = match keywords.get("additionalProperties") {
+            Some(Value::Bool(false)) => Additional::Forbidden,
+            Some(schema @ Value::Object(_)) => Additional::Schema(self.node(schema)),
+            _ => Additional::Allowed,
+        };
+        compiled.items = keywords.get("items").map(|schema| self.node(schema));
+        compiled.pattern = keywords
+            .get("pattern")
+            .and_then(Value::as_str)
+            .map(|pattern| Regex::new(pattern).map_err(|_| pattern.to_string()));
+        compiled.format = keywords
+            .get("format")
+            .and_then(Value::as_str)
+            .and_then(|name| Format::named(name).map(|format| (format, name.to_string())));
+        compiled.all_of = self.branches(keywords, "allOf");
+        compiled.any_of = self.branches(keywords, "anyOf");
+        compiled.one_of = self.branches(keywords, "oneOf");
+        compiled.not = keywords.get("not").map(|schema| self.node(schema));
+        compiled
     }
-    if bound("maximum").is_some_and(|max| number > max) {
-        out.push(issue(
-            "maximum",
-            &format!("{number} is above the maximum"),
-            path,
-        ));
-    }
-    if bound("exclusiveMinimum").is_some_and(|min| number <= min) {
-        out.push(issue(
-            "exclusiveMinimum",
-            &format!("{number} is not above the minimum"),
-            path,
-        ));
-    }
-    if bound("exclusiveMaximum").is_some_and(|max| number >= max) {
-        out.push(issue(
-            "exclusiveMaximum",
-            &format!("{number} is not below the maximum"),
-            path,
-        ));
-    }
-}
 
-fn check_composition(
-    root: &Value,
-    keywords: &Map<String, Value>,
-    instance: &Value,
-    path: &str,
-    out: &mut Vec<ValidationIssue>,
-) {
-    let branches = |name: &str| -> Vec<&Value> {
+    fn branches(&mut self, keywords: &'a Map<String, Value>, name: &str) -> Vec<usize> {
         keywords
             .get(name)
             .and_then(Value::as_array)
-            .map(|b| b.iter().collect())
+            .map(|branches| branches.iter().map(|b| self.node(b)).collect())
             .unwrap_or_default()
-    };
-    for branch in branches("allOf") {
-        out.extend(check(root, branch, instance, path));
     }
-    let any = branches("anyOf");
-    if !any.is_empty()
-        && !any
-            .iter()
-            .any(|b| check(root, b, instance, path).is_empty())
-    {
-        out.push(issue("anyOf", "matches none of the alternatives", path));
-    }
-    let one = branches("oneOf");
-    if !one.is_empty() {
-        let matching = one
-            .iter()
-            .filter(|b| check(root, b, instance, path).is_empty())
-            .count();
-        if matching != 1 {
-            out.push(issue(
-                "oneOf",
-                &format!("matches {matching} alternatives, exactly one required"),
-                path,
-            ));
-        }
-    }
-    if let Some(forbidden) = keywords.get("not")
-        && check(root, forbidden, instance, path).is_empty()
-    {
-        out.push(issue("not", "matches a schema it must not", path));
-    }
-}
-
-fn child(path: &str, name: &str) -> String {
-    format!("{path}/{}", name.replace('~', "~0").replace('/', "~1"))
 }
 
 #[cfg(test)]
@@ -369,74 +226,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn codes(schema: &Value, instance: &Value) -> Vec<String> {
-        check(schema, schema, instance, "")
-            .into_iter()
-            .map(|i| i.code)
-            .collect()
+    #[test]
+    fn a_schema_is_an_object_or_a_boolean_and_is_named_by_id_or_title() {
+        assert!(Schema::compile(&json!("no")).is_err());
+        assert_eq!(Schema::compile(&json!(true)).expect("true").name(), "bound");
+        let titled = json!({ "title": "order", "$id": "urn:order" });
+        assert_eq!(
+            Schema::compile(&titled).expect("titled").name(),
+            "urn:order"
+        );
     }
 
     #[test]
-    fn a_local_ref_resolves_through_defs() {
-        let schema = json!({
-            "$defs": { "id": { "type": "string" } },
-            "properties": { "id": { "$ref": "#/$defs/id" } }
+    fn a_recursive_schema_compiles_each_object_once() {
+        let tree = json!({
+            "$defs": { "node": { "properties": { "children": {
+                "items": { "$ref": "#/$defs/node" } } } } },
+            "$ref": "#/$defs/node"
         });
-        assert!(codes(&schema, &json!({"id": "x"})).is_empty());
-        assert_eq!(codes(&schema, &json!({"id": 1})), ["type"]);
-        let dangling = json!({ "$ref": "#/$defs/nowhere" });
-        assert_eq!(codes(&dangling, &json!(1)), ["$ref"]);
-    }
-
-    #[test]
-    fn integer_admits_a_whole_float_and_refuses_a_fraction() {
-        let schema = json!({ "type": "integer" });
-        assert!(codes(&schema, &json!(2.0)).is_empty());
-        assert_eq!(codes(&schema, &json!(2.5)), ["type"]);
-    }
-
-    #[test]
-    fn composition_keywords_report_as_themselves() {
-        let one = json!({ "oneOf": [{ "type": "string" }, { "type": "number" }] });
-        assert!(codes(&one, &json!("s")).is_empty());
-        assert_eq!(codes(&one, &json!(true)), ["oneOf"]);
-        let not = json!({ "not": { "type": "null" } });
-        assert_eq!(codes(&not, &json!(null)), ["not"]);
-        let any = json!({ "anyOf": [{ "minimum": 10 }, { "maximum": 0 }] });
-        assert_eq!(codes(&any, &json!(5)), ["anyOf"]);
-    }
-
-    #[test]
-    fn a_false_schema_admits_nothing_and_a_pointer_escapes() {
-        assert_eq!(codes(&json!(false), &json!(1)), ["false"]);
-        let schema = json!({ "properties": { "a/b": { "type": "null" } } });
-        let issues = check(&schema, &schema, &json!({"a/b": 1}), "");
-        assert_eq!(issues[0].path.as_deref(), Some("/a~1b"));
-    }
-
-    #[test]
-    fn a_pattern_is_an_unanchored_search_and_a_bad_one_is_named() {
-        let schema = json!({ "pattern": "[A-Z]{2}\\d{4}" });
-        assert!(codes(&schema, &json!("ref SE1234 ok")).is_empty());
-        assert_eq!(codes(&schema, &json!("se1234")), ["pattern"]);
-        let broken = json!({ "pattern": "(" });
-        let issues = check(&broken, &broken, &json!("x"), "");
-        assert!(issues[0].message.contains("is not a pattern"));
-    }
-
-    #[test]
-    fn formats_are_asserted_not_annotated() {
-        let of = |format: &str| json!({ "format": format });
-        assert!(codes(&of("date"), &json!("2026-09-07")).is_empty());
-        assert_eq!(codes(&of("date"), &json!("2026-13-07")), ["format"]);
-        assert!(codes(&of("date-time"), &json!("2026-09-07T13:45:00+02:00")).is_empty());
-        assert!(codes(&of("email"), &json!("ilian@example.se")).is_empty());
-        assert_eq!(codes(&of("email"), &json!("nobody")), ["format"]);
-        assert!(codes(&of("uri"), &json!("xmip:///playground")).is_empty());
-        assert!(codes(&of("ipv6"), &json!("::1")).is_empty());
-        assert!(codes(&of("uuid"), &json!("0192b6d4-7c3e-7f3a-9b2a-3d4e5f6a7b8c")).is_empty());
-        assert_eq!(codes(&of("uuid"), &json!("not-a-uuid")), ["format"]);
-        assert_eq!(codes(&of("regex"), &json!("(")), ["format"]);
-        assert!(codes(&of("hostname-we-do-not-check"), &json!("anything")).is_empty());
+        let schema = Schema::compile(&tree).expect("compiles");
+        // The root, node, children and its items: four objects, four nodes.
+        assert_eq!(schema.nodes.len(), 4);
     }
 }

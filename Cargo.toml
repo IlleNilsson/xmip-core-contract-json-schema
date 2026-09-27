@@ -30,6 +30,10 @@ serde_json = "1"
 # pattern in a schema cannot stall a Receive Location.
 regex = "1"
 
+# `date`, `time` and `date-time` are RFC 3339's, read by the estate's one
+# calendar.
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+
 [dev-dependencies]
 # The parent's Stream fixture, for the tests only (ADR-0044).
 contract = { package = "xmip-core-contract", git = "https://github.com/IlleNilsson/xmip-core-contract", branch = "main", features = ["test-support"] }

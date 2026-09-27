@@ -12,6 +12,7 @@
 //! [`schema`] documents; anything outside it is ignored, as the specification
 //! says an unknown keyword must be.
 
+pub mod check;
 pub mod format;
 pub mod schema;
 
@@ -19,6 +20,7 @@ use contract::{
     Contract, ContractDescriptor, ContractError, ContractFactory, ContractId, ValidationIssue,
     ValidationResult,
 };
+use schema::Schema;
 use serde_json::Value;
 use stream::Stream;
 use xcore::settings::{Applies, Kind, Presence, Setting, Settings};
@@ -26,7 +28,7 @@ use xcore::settings::{Applies, Kind, Presence, Setting, Settings};
 /// The JSON contract, bare or bound to a schema.
 pub struct JsonSchema {
     descriptor: ContractDescriptor,
-    schema: Option<Value>,
+    schema: Option<Schema>,
 }
 
 impl JsonSchema {
@@ -39,23 +41,14 @@ impl JsonSchema {
         }
     }
 
-    /// Well-formedness and conformance to `schema`.
+    /// Well-formedness and conformance to `schema`, compiled here, once.
     ///
     /// # Errors
     /// The schema must itself be a JSON Schema: an object or a boolean.
-    pub fn with_schema(schema: Value) -> Result<Self, ContractError> {
-        if !(schema.is_object() || schema.is_boolean()) {
-            return Err(ContractError {
-                message: "a JSON Schema is an object or a boolean".to_string(),
-            });
-        }
-        let name = schema
-            .get("$id")
-            .or_else(|| schema.get("title"))
-            .and_then(Value::as_str)
-            .unwrap_or("bound");
+    pub fn with_schema(schema: &Value) -> Result<Self, ContractError> {
+        let schema = Schema::compile(schema)?;
         Ok(Self {
-            descriptor: descriptor(&format!("json-schema:{name}")),
+            descriptor: descriptor(&format!("json-schema:{}", schema.name())),
             schema: Some(schema),
         })
     }
@@ -104,7 +97,7 @@ impl Contract for JsonSchema {
             Err(error) => return Ok(malformed(&error)),
         };
         let issues = match &self.schema {
-            Some(schema) => schema::check(schema, schema, &instance, ""),
+            Some(schema) => schema.check(&instance),
             None => Vec::new(),
         };
         Ok(ValidationResult::of(issues))
@@ -119,8 +112,8 @@ fn is_json_media_type(media_type: &str) -> bool {
 fn malformed(error: &serde_json::Error) -> ValidationResult {
     ValidationResult::of(vec![ValidationIssue::at(
         "malformed",
-        &format!("not valid JSON: {error}"),
-        &format!("line {} column {}", error.line(), error.column()),
+        format!("not valid JSON: {error}"),
+        format!("line {} column {}", error.line(), error.column()),
     )])
 }
 
@@ -147,7 +140,7 @@ impl ContractFactory for JsonSchemaFactory {
         let schema = serde_json::from_slice::<Value>(&bytes).map_err(|error| ContractError {
             message: format!("schema {reference} is not valid JSON: {error}"),
         })?;
-        Ok(Box::new(JsonSchema::with_schema(schema)?))
+        Ok(Box::new(JsonSchema::with_schema(&schema)?))
     }
 }
 
@@ -214,7 +207,7 @@ mod tests {
 
     #[test]
     fn bound_contract_holds_a_conforming_order() {
-        let bound = JsonSchema::with_schema(order_schema()).expect("a schema");
+        let bound = JsonSchema::with_schema(&order_schema()).expect("a schema");
         assert_eq!(bound.descriptor().id.0, "json-schema:order");
         let text = r#"{"id":"A1","lines":[{"sku":"X","qty":2}]}"#;
         let held = bound.validate(&stream(text, None)).expect("validates");
@@ -223,7 +216,7 @@ mod tests {
 
     #[test]
     fn bound_contract_names_every_departure_with_its_path() {
-        let bound = JsonSchema::with_schema(order_schema()).expect("a schema");
+        let bound = JsonSchema::with_schema(&order_schema()).expect("a schema");
         let text = r#"{"id":"","lines":[{"sku":1,"qty":0}],"extra":true}"#;
         let held = bound.validate(&stream(text, None)).expect("validates");
         assert!(!held.valid);
@@ -240,8 +233,25 @@ mod tests {
 
     #[test]
     fn a_schema_must_be_an_object_or_boolean() {
-        assert!(JsonSchema::with_schema(json!("no")).is_err());
-        assert!(JsonSchema::with_schema(json!(true)).is_ok());
+        assert!(JsonSchema::with_schema(&json!("no")).is_err());
+        assert!(JsonSchema::with_schema(&json!(true)).is_ok());
+    }
+
+    #[test]
+    fn a_bound_schema_is_read_once_so_a_message_costs_only_its_own_walk() {
+        let bound = JsonSchema::with_schema(&order_schema()).expect("a schema");
+        let order = stream(r#"{"id":"A1","lines":[{"sku":"X","qty":2}]}"#, None);
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert!(bound.validate(&order).expect("validates").valid);
+        }
+        // Generous for a debug build on a loaded machine; a schema read per
+        // message, or a lock per pattern, is what it catches.
+        let each = started.elapsed() / 10_000;
+        assert!(
+            each < std::time::Duration::from_micros(500),
+            "{each:?} a message"
+        );
     }
 
     #[test]
