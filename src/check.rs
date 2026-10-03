@@ -379,7 +379,7 @@ mod tests {
         );
         assert!(codes(&of("email"), &json!("ilian@example.se")).is_empty());
         assert_eq!(codes(&of("email"), &json!("nobody")), ["format"]);
-        assert!(codes(&of("uri"), &json!("xmip:///playground")).is_empty());
+        assert!(codes(&of("uri"), &json!("xmip:///")).is_empty());
         assert!(codes(&of("ipv6"), &json!("::1")).is_empty());
         assert!(codes(&of("uuid"), &json!("0192b6d4-7c3e-7f3a-9b2a-3d4e5f6a7b8c")).is_empty());
         assert_eq!(codes(&of("uuid"), &json!("not-a-uuid")), ["format"]);
