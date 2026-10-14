@@ -307,7 +307,10 @@ mod tests {
             "$defs": { "id": { "type": "string" } },
             "properties": { "id": { "$ref": "#/$defs/id" } }
         });
-        assert!(codes(&schema, &json!({"id": "x"})).is_empty());
+        assert_eq!(
+            codes(&schema, &json!({"id": "x"})),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(codes(&schema, &json!({"id": 1})), ["type"]);
         let dangling = json!({ "$ref": "#/$defs/nowhere" });
         assert_eq!(codes(&dangling, &json!(1)), ["$ref"]);
@@ -321,14 +324,14 @@ mod tests {
     #[test]
     fn integer_admits_a_whole_float_and_refuses_a_fraction() {
         let schema = json!({ "type": "integer" });
-        assert!(codes(&schema, &json!(2.0)).is_empty());
+        assert_eq!(codes(&schema, &json!(2.0)), [] as [std::string::String; 0]);
         assert_eq!(codes(&schema, &json!(2.5)), ["type"]);
     }
 
     #[test]
     fn composition_keywords_report_as_themselves() {
         let one = json!({ "oneOf": [{ "type": "string" }, { "type": "number" }] });
-        assert!(codes(&one, &json!("s")).is_empty());
+        assert_eq!(codes(&one, &json!("s")), [] as [std::string::String; 0]);
         assert_eq!(codes(&one, &json!(true)), ["oneOf"]);
         let not = json!({ "not": { "type": "null" } });
         assert_eq!(codes(&not, &json!(null)), ["not"]);
@@ -353,7 +356,10 @@ mod tests {
     #[test]
     fn a_pattern_is_an_unanchored_search_and_a_bad_one_is_named() {
         let schema = json!({ "pattern": "[A-Z]{2}\\d{4}" });
-        assert!(codes(&schema, &json!("ref SE1234 ok")).is_empty());
+        assert_eq!(
+            codes(&schema, &json!("ref SE1234 ok")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(codes(&schema, &json!("se1234")), ["pattern"]);
         let broken = json!({ "pattern": "(" });
         let issues = Schema::compile(&broken)
@@ -365,25 +371,52 @@ mod tests {
     #[test]
     fn formats_are_asserted_not_annotated() {
         let of = |format: &str| json!({ "format": format });
-        assert!(codes(&of("date"), &json!("2026-09-07")).is_empty());
+        assert_eq!(
+            codes(&of("date"), &json!("2026-09-07")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(codes(&of("date"), &json!("2026-13-07")), ["format"]);
         assert_eq!(codes(&of("date"), &json!("2026-02-31")), ["format"]);
         assert_eq!(codes(&of("date"), &json!("2026-02-29")), ["format"]);
-        assert!(codes(&of("date"), &json!("2028-02-29")).is_empty());
-        assert!(codes(&of("time"), &json!("13:45:00Z")).is_empty());
+        assert_eq!(
+            codes(&of("date"), &json!("2028-02-29")),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            codes(&of("time"), &json!("13:45:00Z")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(codes(&of("time"), &json!("25:45:00Z")), ["format"]);
-        assert!(codes(&of("date-time"), &json!("2026-09-07T13:45:00+02:00")).is_empty());
+        assert_eq!(
+            codes(&of("date-time"), &json!("2026-09-07T13:45:00+02:00")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(
             codes(&of("date-time"), &json!("2026-02-31T13:45:00Z")),
             ["format"]
         );
-        assert!(codes(&of("email"), &json!("ilian@example.se")).is_empty());
+        assert_eq!(
+            codes(&of("email"), &json!("ilian@example.se")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(codes(&of("email"), &json!("nobody")), ["format"]);
-        assert!(codes(&of("uri"), &json!("xmip:///")).is_empty());
-        assert!(codes(&of("ipv6"), &json!("::1")).is_empty());
-        assert!(codes(&of("uuid"), &json!("0192b6d4-7c3e-7f3a-9b2a-3d4e5f6a7b8c")).is_empty());
+        assert_eq!(
+            codes(&of("uri"), &json!("xmip:///")),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            codes(&of("ipv6"), &json!("::1")),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            codes(&of("uuid"), &json!("0192b6d4-7c3e-7f3a-9b2a-3d4e5f6a7b8c")),
+            [] as [std::string::String; 0]
+        );
         assert_eq!(codes(&of("uuid"), &json!("not-a-uuid")), ["format"]);
         assert_eq!(codes(&of("regex"), &json!("(")), ["format"]);
-        assert!(codes(&of("hostname-we-do-not-check"), &json!("anything")).is_empty());
+        assert_eq!(
+            codes(&of("hostname-we-do-not-check"), &json!("anything")),
+            [] as [std::string::String; 0]
+        );
     }
 }
