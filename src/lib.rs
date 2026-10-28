@@ -91,16 +91,30 @@ impl Contract for JsonSchema {
         Ok(matches!(first, Some(b'{' | b'[')))
     }
 
+    /// Bare, the Stream is read a piece at a time and nothing of it is kept,
+    /// so well-formedness holds in bounded memory however large the
+    /// Stream; bound, the document is read whole, as a schema's keywords
+    /// look across it.
     fn validate(&self, stream: &Stream) -> Result<ValidationResult, ContractError> {
+        let Some(schema) = &self.schema else {
+            use serde::Deserialize as _;
+            let reader = stream.reader().map_err(|failed| {
+                ContractError::new(format!("the Stream cannot be read: {failed}"))
+            })?;
+            let reading = std::io::BufReader::with_capacity(64 * 1024, reader);
+            let mut document = serde_json::Deserializer::from_reader(reading);
+            let held =
+                serde::de::IgnoredAny::deserialize(&mut document).and_then(|_| document.end());
+            return Ok(match held {
+                Ok(()) => ValidationResult::of(Vec::new()),
+                Err(error) => malformed(&error),
+            });
+        };
         let instance = match serde_json::from_slice::<Value>(stream.bytes()) {
             Ok(instance) => instance,
             Err(error) => return Ok(malformed(&error)),
         };
-        let issues = match &self.schema {
-            Some(schema) => schema.check(&instance),
-            None => Vec::new(),
-        };
-        Ok(ValidationResult::of(issues))
+        Ok(ValidationResult::of(schema.check(&instance)))
     }
 }
 
