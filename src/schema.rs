@@ -84,12 +84,28 @@ impl Schema {
     /// Compile `document` as a JSON Schema.
     ///
     /// # Errors
-    /// The document must itself be a JSON Schema: an object or a boolean.
+    /// The document must itself be a JSON Schema: an object or a boolean,
+    /// whose every `$ref` lands inside it. A reference to another document
+    /// is refused, one over a network by name: Xmip fetches nothing a
+    /// schema names (ADR-0045, offline is the default).
     pub fn compile(document: &Value) -> Result<Self, ContractError> {
         if !(document.is_object() || document.is_boolean()) {
             return Err(ContractError::new(
                 "a JSON Schema is an object or a boolean",
             ));
+        }
+        if let Some(outside) = outside(document) {
+            return Err(ContractError::new(if outside.contains("://") {
+                format!(
+                    "the schema refers to '{outside}' over a network, which Xmip never \
+                     fetches; bundle it into the schema under $defs"
+                )
+            } else {
+                format!(
+                    "the schema refers to '{outside}' in another document, which is not \
+                     followed; bundle it into the schema under $defs"
+                )
+            }));
         }
         let name = document
             .get("$id")
@@ -113,6 +129,21 @@ impl Schema {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// The first `$ref` under `value` that is not a fragment of the document
+/// itself.
+fn outside(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get("$ref")
+            .and_then(Value::as_str)
+            .filter(|reference| !reference.starts_with('#'))
+            .map(str::to_string)
+            .or_else(|| object.values().find_map(outside)),
+        Value::Array(items) => items.iter().find_map(outside),
+        _ => None,
     }
 }
 
@@ -225,6 +256,23 @@ impl<'a> Compiler<'a> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_reference_outside_the_schema_is_refused_and_never_fetched() {
+        let remote = json!({ "properties": { "a": { "$ref": "https://example.test/a.json" } } });
+        let refused = Schema::compile(&remote).expect_err("refused");
+        assert!(refused.to_string().contains("over a network"), "{refused}");
+        let other = json!({ "items": [{ "$ref": "common.json#/$defs/id" }] });
+        let refused = Schema::compile(&other).expect_err("refused");
+        assert!(
+            refused.to_string().contains("another document"),
+            "{refused}"
+        );
+        assert!(
+            Schema::compile(&json!({ "$schema": "https://json-schema.org/draft/2020-12/schema" }))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn a_schema_is_an_object_or_a_boolean_and_is_named_by_id_or_title() {
