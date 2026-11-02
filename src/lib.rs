@@ -176,29 +176,9 @@ mod tests {
     use contract::fixture::stream_as as stream;
     use serde_json::json;
 
-    fn order_schema() -> Value {
-        json!({
-            "$id": "order",
-            "type": "object",
-            "required": ["id", "lines"],
-            "properties": {
-                "id": { "type": "string", "minLength": 1 },
-                "lines": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "required": ["sku", "qty"],
-                        "properties": {
-                            "sku": { "type": "string" },
-                            "qty": { "type": "integer", "minimum": 1 }
-                        }
-                    }
-                }
-            },
-            "additionalProperties": false
-        })
-    }
+    #[path = "../../tests/measured/order.rs"]
+    mod order;
+    use order::order_schema;
 
     #[test]
     fn bare_contract_holds_well_formed_json_only() {
@@ -249,23 +229,6 @@ mod tests {
     fn a_schema_must_be_an_object_or_boolean() {
         assert!(JsonSchema::with_schema(&json!("no")).is_err());
         assert!(JsonSchema::with_schema(&json!(true)).is_ok());
-    }
-
-    #[test]
-    fn a_bound_schema_is_read_once_so_a_message_costs_only_its_own_walk() {
-        let bound = JsonSchema::with_schema(&order_schema()).expect("a schema");
-        let order = stream(r#"{"id":"A1","lines":[{"sku":"X","qty":2}]}"#, None);
-        let started = std::time::Instant::now();
-        for _ in 0..10_000 {
-            assert!(bound.validate(&order).expect("validates").valid);
-        }
-        // Generous for a debug build on a loaded machine; a schema read per
-        // message, or a lock per pattern, is what it catches.
-        let each = started.elapsed() / 10_000;
-        assert!(
-            each < std::time::Duration::from_micros(500),
-            "{each:?} a message"
-        );
     }
 
     #[test]
