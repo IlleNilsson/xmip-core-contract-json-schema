@@ -84,7 +84,7 @@ impl Contract for JsonSchema {
             return Ok(true);
         }
         let first = stream
-            .bytes()
+            .load()?
             .iter()
             .copied()
             .find(|byte| !byte.is_ascii_whitespace());
@@ -110,7 +110,7 @@ impl Contract for JsonSchema {
                 Err(error) => malformed(&error),
             });
         };
-        let instance = match serde_json::from_slice::<Value>(stream.bytes()) {
+        let instance = match serde_json::from_slice::<Value>(stream.load()?) {
             Ok(instance) => instance,
             Err(error) => return Ok(malformed(&error)),
         };
