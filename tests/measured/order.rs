@@ -1,6 +1,6 @@
 //! The order schema a bound schema is tested with: what the crate's tests
 //! and its timing program both validate against. Shared, not copied:
-//! `src/lib.rs`'s tests take it with `#[path]`.
+//! `src/lib.rs` takes it for its tests with `#[path]`.
 
 /// An order: an id and at least one line, each a sku and a quantity.
 pub fn order_schema() -> serde_json::Value {

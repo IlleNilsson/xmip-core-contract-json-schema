@@ -170,15 +170,20 @@ const SETTINGS: &Settings = &Settings {
     }],
 };
 
+// Declared here and not in `tests`: a path from an inline module passes
+// through a directory named for it that does not exist, which Windows
+// forgives and Linux does not.
+#[cfg(test)]
+#[path = "../tests/measured/order.rs"]
+mod order;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use contract::fixture::stream_as as stream;
     use serde_json::json;
 
-    #[path = "../../tests/measured/order.rs"]
-    mod order;
-    use order::order_schema;
+    use crate::order::order_schema;
 
     #[test]
     fn bare_contract_holds_well_formed_json_only() {
