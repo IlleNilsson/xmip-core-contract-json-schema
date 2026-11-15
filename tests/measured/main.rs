@@ -18,15 +18,23 @@ use xmip_core_contract_json_schema::JsonSchema;
 fn a_bound_schema_is_read_once_so_a_message_costs_only_its_own_walk() {
     let bound = JsonSchema::with_schema(&order_schema()).expect("a schema");
     let order = stream(r#"{"id":"A1","lines":[{"sku":"X","qty":2}]}"#, None);
-    let started = std::time::Instant::now();
-    for _ in 0..10_000 {
-        assert!(bound.validate(&order).expect("validates").valid);
-    }
-    // Generous for a debug build on a loaded machine; a schema read per
-    // message, or a lock per pattern, is what it catches.
-    let each = started.elapsed() / 10_000;
+    // Each message timed, the fastest of five (`xcore::latency::spread`): a
+    // schema read per message, or a lock per pattern, is in every one, a
+    // busy machine's preemption in some. It waits on no wake, so no plain
+    // wake is measured beside it. Until 2026-11-15 the ten thousand were
+    // timed together.
+    let each = (0..10_000)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            let valid = bound.validate(&order).expect("validates").valid;
+            let took = started.elapsed();
+            assert!(valid);
+            took
+        })
+        .collect();
+    let each = xcore::latency::spread("a conforming order validated", each);
     assert!(
-        each < std::time::Duration::from_micros(500),
+        each.fastest_of_five < std::time::Duration::from_micros(500),
         "{each:?} a message"
     );
 }
