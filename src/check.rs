@@ -5,40 +5,141 @@
 //! whole document), so an operator reads `/lines/0/qty: minimum`. The
 //! pointer is spelled only for an issue raised; an instance that holds costs
 //! none.
+//!
+//! The walk is bounded: at most [`DEPTH`] schemas deep, and at most the
+//! schema's size times the instance's bytes plus one steps, each schema a
+//! place is held to a step. A schema that holds one place to the same
+//! schemas over and over, doubling at each level, stops there rather than
+//! running for ever; past either bound the walk ends with one issue coded
+//! `bound`, where it stopped.
 
+use crate::chain::DEPTH;
 use crate::schema::{Additional, Keywords, Node, Schema};
 use contract::ValidationIssue;
 use contract::place::Place;
 use serde_json::Value;
 
+/// How far a check may still go: the steps it has left and how many
+/// schemas deep it is.
+struct Walk {
+    left: usize,
+    depth: usize,
+}
+
+/// Where a check stopped, and which bound stopped it.
+enum Stop {
+    /// [`DEPTH`] schemas deep.
+    Deep(String),
+    /// Out of steps.
+    Spent(String),
+}
+
 impl Schema {
-    /// Every way `instance` departs from this schema.
+    /// Every way `instance`, read from `read` bytes, departs from this
+    /// schema; past the walk's bound, the issues found so far and one coded
+    /// `bound`.
     #[must_use]
-    pub fn check(&self, instance: &Value) -> Vec<ValidationIssue> {
+    pub fn check(&self, instance: &Value, read: usize) -> Vec<ValidationIssue> {
+        let size = self.nodes.len();
+        let steps = size.saturating_mul(read.saturating_add(1));
+        let mut walk = Walk {
+            left: steps,
+            depth: 0,
+        };
         let mut issues = Vec::new();
-        self.node(0, instance, &Place::Root, &mut issues);
+        let stopped = match self.node(0, instance, &Place::Root, &mut walk, &mut issues) {
+            Ok(()) => return issues,
+            Err(Stop::Deep(path)) => ValidationIssue::at(
+                "bound",
+                format!("is held to {DEPTH} schemas at once, the most a check follows"),
+                path,
+            ),
+            Err(Stop::Spent(path)) => ValidationIssue::at(
+                "bound",
+                format!(
+                    "took the {steps} steps a schema of {size} parts may take over {read} \
+                     bytes; it holds a place to the same schemas over and over"
+                ),
+                path,
+            ),
+        };
+        issues.push(stopped);
         issues
     }
 
     /// Whether `instance` holds to node `id`, for a composition that only
     /// asks.
-    fn holds(&self, id: usize, instance: &Value, place: &Place<'_>) -> bool {
+    fn holds(
+        &self,
+        id: usize,
+        instance: &Value,
+        place: &Place<'_>,
+        walk: &mut Walk,
+    ) -> Result<bool, Stop> {
         let mut issues = Vec::new();
-        self.node(id, instance, place, &mut issues);
-        issues.is_empty()
+        self.node(id, instance, place, walk, &mut issues)?;
+        Ok(issues.is_empty())
     }
 
-    fn node(&self, id: usize, instance: &Value, place: &Place<'_>, out: &mut Vec<ValidationIssue>) {
+    /// Whether `instance` holds to any of `branches`, asking no further
+    /// once one does.
+    fn any_holds(
+        &self,
+        branches: &[usize],
+        instance: &Value,
+        place: &Place<'_>,
+        walk: &mut Walk,
+    ) -> Result<bool, Stop> {
+        for &branch in branches {
+            if self.holds(branch, instance, place, walk)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Holds `instance` to node `id`: one step, and one schema deeper while
+    /// it lasts.
+    fn node(
+        &self,
+        id: usize,
+        instance: &Value,
+        place: &Place<'_>,
+        walk: &mut Walk,
+        out: &mut Vec<ValidationIssue>,
+    ) -> Result<(), Stop> {
+        if walk.depth == DEPTH {
+            return Err(Stop::Deep(place.pointer()));
+        }
+        let Some(left) = walk.left.checked_sub(1) else {
+            return Err(Stop::Spent(place.pointer()));
+        };
+        walk.left = left;
+        walk.depth += 1;
+        let held = self.keywords(id, instance, place, walk, out);
+        walk.depth -= 1;
+        held
+    }
+
+    /// Holds `instance` to what node `id` says.
+    fn keywords(
+        &self,
+        id: usize,
+        instance: &Value,
+        place: &Place<'_>,
+        walk: &mut Walk,
+        out: &mut Vec<ValidationIssue>,
+    ) -> Result<(), Stop> {
         let keywords = match &self.nodes[id] {
-            Node::Any => return,
+            Node::Any => return Ok(()),
             Node::Nothing => {
                 out.push(issue("false", "nothing is allowed here", place));
-                return;
+                return Ok(());
             }
             Node::Keywords(keywords) => keywords,
         };
         match &keywords.reference {
-            Some(Ok(target)) => self.node(*target, instance, place, out),
+            Some(Ok(target)) => self.node(*target, instance, place, walk, out)?,
             Some(Err(reference)) => {
                 out.push(issue("$ref", format!("unresolvable {reference}"), place));
             }
@@ -46,11 +147,11 @@ impl Schema {
         }
         check_type(keywords, instance, place, out);
         check_values(keywords, instance, place, out);
-        self.check_object(keywords, instance, place, out);
-        self.check_array(keywords, instance, place, out);
+        self.check_object(keywords, instance, place, walk, out)?;
+        self.check_array(keywords, instance, place, walk, out)?;
         check_string(keywords, instance, place, out);
         check_number(keywords, instance, place, out);
-        self.check_composition(keywords, instance, place, out);
+        self.check_composition(keywords, instance, place, walk, out)
     }
 
     fn check_object(
@@ -58,10 +159,11 @@ impl Schema {
         keywords: &Keywords,
         instance: &Value,
         place: &Place<'_>,
+        walk: &mut Walk,
         out: &mut Vec<ValidationIssue>,
-    ) {
+    ) -> Result<(), Stop> {
         let Value::Object(members) = instance else {
-            return;
+            return Ok(());
         };
         for name in &keywords.required {
             if !members.contains_key(name) {
@@ -73,7 +175,7 @@ impl Schema {
             let member = place.field(name);
             match (keywords.properties.get(name), &keywords.additional) {
                 (Some(&id), _) | (None, &Additional::Schema(id)) => {
-                    self.node(id, value, &member, out);
+                    self.node(id, value, &member, walk, out)?;
                 }
                 (None, Additional::Forbidden) => {
                     out.push(issue(
@@ -85,6 +187,7 @@ impl Schema {
                 (None, Additional::Allowed) => {}
             }
         }
+        Ok(())
     }
 
     fn check_array(
@@ -92,10 +195,11 @@ impl Schema {
         keywords: &Keywords,
         instance: &Value,
         place: &Place<'_>,
+        walk: &mut Walk,
         out: &mut Vec<ValidationIssue>,
-    ) {
+    ) -> Result<(), Stop> {
         let Value::Array(items) = instance else {
-            return;
+            return Ok(());
         };
         let length = items.len() as u64;
         if let Some(min) = keywords.min_items
@@ -112,9 +216,10 @@ impl Schema {
         }
         if let Some(id) = keywords.items {
             for (index, item) in items.iter().enumerate() {
-                self.node(id, item, &place.index(index), out);
+                self.node(id, item, &place.index(index), walk, out)?;
             }
         }
+        Ok(())
     }
 
     fn check_composition(
@@ -122,35 +227,35 @@ impl Schema {
         keywords: &Keywords,
         instance: &Value,
         place: &Place<'_>,
+        walk: &mut Walk,
         out: &mut Vec<ValidationIssue>,
-    ) {
+    ) -> Result<(), Stop> {
         for &branch in &keywords.all_of {
-            self.node(branch, instance, place, out);
+            self.node(branch, instance, place, walk, out)?;
         }
         if !keywords.any_of.is_empty()
-            && !keywords
-                .any_of
-                .iter()
-                .any(|&b| self.holds(b, instance, place))
+            && !self.any_holds(&keywords.any_of, instance, place, walk)?
         {
             out.push(issue("anyOf", "matches none of the alternatives", place));
         }
         if !keywords.one_of.is_empty() {
-            let matching = keywords
-                .one_of
-                .iter()
-                .filter(|&&b| self.holds(b, instance, place))
-                .count();
+            let mut matching = 0;
+            for &branch in &keywords.one_of {
+                if self.holds(branch, instance, place, walk)? {
+                    matching += 1;
+                }
+            }
             if matching != 1 {
                 let message = format!("matches {matching} alternatives, exactly one required");
                 out.push(issue("oneOf", message, place));
             }
         }
         if let Some(forbidden) = keywords.not
-            && self.holds(forbidden, instance, place)
+            && self.holds(forbidden, instance, place, walk)?
         {
             out.push(issue("not", "matches a schema it must not", place));
         }
+        Ok(())
     }
 }
 
@@ -292,10 +397,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn codes(schema: &Value, instance: &Value) -> Vec<String> {
+    /// `instance` held to `schema`, read from the bytes it is written in.
+    fn issues(schema: &Value, instance: &Value) -> Vec<ValidationIssue> {
         Schema::compile(schema)
             .expect("a schema")
-            .check(instance)
+            .check(instance, instance.to_string().len())
+    }
+
+    fn codes(schema: &Value, instance: &Value) -> Vec<String> {
+        issues(schema, instance)
             .into_iter()
             .map(|i| i.code.into_owned())
             .collect()
@@ -343,13 +453,9 @@ mod tests {
     fn a_false_schema_admits_nothing_and_a_pointer_escapes() {
         assert_eq!(codes(&json!(false), &json!(1)), ["false"]);
         let schema = json!({ "properties": { "a/b": { "type": "null" } } });
-        let issues = Schema::compile(&schema)
-            .expect("a schema")
-            .check(&json!({"a/b": 1}));
-        assert_eq!(issues[0].path.as_deref(), Some("/a~1b"));
-        let whole = Schema::compile(&json!(false))
-            .expect("false")
-            .check(&json!(1));
+        let escaped = issues(&schema, &json!({"a/b": 1}));
+        assert_eq!(escaped[0].path.as_deref(), Some("/a~1b"));
+        let whole = issues(&json!(false), &json!(1));
         assert_eq!(whole[0].path.as_deref(), Some(""), "the whole document");
     }
 
@@ -362,10 +468,8 @@ mod tests {
         );
         assert_eq!(codes(&schema, &json!("se1234")), ["pattern"]);
         let broken = json!({ "pattern": "(" });
-        let issues = Schema::compile(&broken)
-            .expect("a schema")
-            .check(&json!("x"));
-        assert!(issues[0].message.contains("is not a pattern"));
+        let named = issues(&broken, &json!("x"));
+        assert!(named[0].message.contains("is not a pattern"));
     }
 
     #[test]

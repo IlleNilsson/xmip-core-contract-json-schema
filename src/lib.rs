@@ -12,6 +12,7 @@
 //! [`schema`] documents; anything outside it is ignored, as the specification
 //! says an unknown keyword must be.
 
+pub mod chain;
 pub mod check;
 pub mod format;
 pub mod schema;
@@ -44,7 +45,8 @@ impl JsonSchema {
     /// Well-formedness and conformance to `schema`, compiled here, once.
     ///
     /// # Errors
-    /// The schema must itself be a JSON Schema: an object or a boolean.
+    /// The schema must itself be a JSON Schema: an object or a boolean, whose
+    /// references end ([`Schema::compile`]).
     pub fn with_schema(schema: &Value) -> Result<Self, ContractError> {
         let schema = Schema::compile(schema)?;
         Ok(Self {
@@ -110,11 +112,12 @@ impl Contract for JsonSchema {
                 Err(error) => malformed(&error),
             });
         };
-        let instance = match serde_json::from_slice::<Value>(stream.load()?) {
+        let read = stream.load()?;
+        let instance = match serde_json::from_slice::<Value>(read) {
             Ok(instance) => instance,
             Err(error) => return Ok(malformed(&error)),
         };
-        Ok(ValidationResult::of(schema.check(&instance)))
+        Ok(ValidationResult::of(schema.check(&instance, read.len())))
     }
 }
 
@@ -274,6 +277,158 @@ mod tests {
                 .load(dir.join("missing.json").to_str().expect("path"))
                 .is_err()
         );
+    }
+
+    /// The stack a schema is bound and held on here: Rust's default for a
+    /// thread, the one a node's threads have. A walk that never ends
+    /// overflows it and aborts the run, naming the thread; a check at its
+    /// depth bound fits, unoptimized too (about 1.1 MiB, 2026-11-19).
+    const STACK: usize = 2 * 1024 * 1024;
+
+    /// A stack a bind reading schemas by recursion, one frame for each, runs
+    /// out of within a few hundred; a bind from a worklist needs no more for
+    /// a long schema than for a short one.
+    const SMALL: usize = 64 * 1024;
+
+    /// How long a bind and a hold may take before the test fails. Not a time
+    /// held to (`rust-style.md` 5c): it catches a walk that never ends.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// [`held_on`] the [`STACK`].
+    fn held(schema: Value, document: String) -> Result<Vec<ValidationIssue>, String> {
+        held_on(STACK, schema, document)
+    }
+
+    /// Binds `schema` as a Location does and holds `document` to it, on a
+    /// thread of its own with `stack` and [`DEADLINE`]: the refusal at bind,
+    /// or every issue the document raised.
+    fn held_on(
+        stack: usize,
+        schema: Value,
+        document: String,
+    ) -> Result<Vec<ValidationIssue>, String> {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("bound-and-held".into())
+            .stack_size(stack)
+            .spawn(move || {
+                let held = JsonSchema::with_schema(&schema)
+                    .and_then(|bound| bound.validate(&stream(&document, None)))
+                    .map(|result| result.issues)
+                    .map_err(|refused| refused.message);
+                let _ = done.send(held);
+            })
+            .expect("a thread");
+        finished
+            .recv_timeout(DEADLINE)
+            .expect("bound and held within the deadline")
+    }
+
+    fn codes(issues: &[ValidationIssue]) -> Vec<&str> {
+        issues.iter().map(|issue| issue.code.as_ref()).collect()
+    }
+
+    /// `levels` objects, each the `child` of the one above, the deepest
+    /// holding `{"value": leaf}`.
+    fn nested(levels: usize, leaf: &str) -> String {
+        format!(
+            "{}{{\"value\":{leaf}}}{}",
+            "{\"child\":".repeat(levels),
+            "}".repeat(levels)
+        )
+    }
+
+    /// `$defs` of `links` schemas, each made by `link` from the reference to
+    /// the next, the last a string; the root refers to the first.
+    fn linked(links: usize, link: impl Fn(String) -> Value) -> Value {
+        let mut defs = serde_json::Map::new();
+        for at in 0..links {
+            defs.insert(format!("s{at}"), link(format!("#/$defs/s{}", at + 1)));
+        }
+        defs.insert(format!("s{links}"), json!({ "type": "string" }));
+        json!({ "$defs": defs, "$ref": "#/$defs/s0" })
+    }
+
+    #[test]
+    fn a_schema_referring_to_itself_without_descending_is_refused_at_bind() {
+        let refused = held(json!({ "$ref": "#" }), "1".into()).expect_err("refused at bind");
+        assert!(refused.contains("$ref '#'"), "{refused}");
+    }
+
+    #[test]
+    fn mutual_references_without_descending_are_refused() {
+        let mutual = json!({
+            "$defs": { "a": { "$ref": "#/$defs/b" }, "b": { "$ref": "#/$defs/a" } },
+            "$ref": "#/$defs/a"
+        });
+        let refused = held(mutual, "1".into()).expect_err("refused at bind");
+        assert!(refused.contains("$ref '#/$defs/a'"), "{refused}");
+    }
+
+    #[test]
+    #[expect(
+        non_snake_case,
+        reason = "the keywords are named as JSON Schema spells them"
+    )]
+    fn a_cycle_through_allOf_anyOf_oneOf_or_not_is_refused() {
+        for cycle in [
+            json!({ "allOf": [{ "$ref": "#" }] }),
+            json!({ "anyOf": [{ "type": "string" }, { "$ref": "#" }] }),
+            json!({ "oneOf": [{ "type": "string" }, { "$ref": "#" }] }),
+            json!({ "not": { "$ref": "#" } }),
+        ] {
+            let refused = held(cycle.clone(), "1".into()).expect_err("refused at bind");
+            assert!(refused.contains("$ref '#'"), "{cycle}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_recursive_tree_that_descends_holds_100_levels_and_names_a_departure_at_depth() {
+        let tree = json!({
+            "$defs": { "node": {
+                "type": "object",
+                "properties": {
+                    "child": { "$ref": "#/$defs/node" },
+                    "value": { "type": "integer" }
+                }
+            } },
+            "$ref": "#/$defs/node"
+        });
+        assert_eq!(held(tree.clone(), nested(100, "1")), Ok(Vec::new()));
+        let departed = held(tree, nested(100, "\"x\"")).expect("bound");
+        assert_eq!(codes(&departed), ["type"]);
+        let path = format!("{}/value", "/child".repeat(100));
+        assert_eq!(departed[0].path.as_deref(), Some(path.as_str()));
+        // Five schemas a level: past the depth a check follows, it stops there.
+        let winding = json!({
+            "$defs": { "node": { "properties": { "child": { "allOf": [{ "allOf": [
+                { "allOf": [{ "$ref": "#/$defs/node" }] }
+            ] }] } } } },
+            "$ref": "#/$defs/node"
+        });
+        let stopped = held(winding, nested(110, "1")).expect("bound");
+        assert_eq!(codes(&stopped), ["bound"], "{stopped:?}");
+        let deep = stopped[0].path.as_deref().unwrap_or_default();
+        assert!(deep.starts_with(&"/child".repeat(100)), "{deep}");
+    }
+
+    #[test]
+    fn a_chain_of_1000_references_is_refused_at_bind_without_overflow() {
+        let chain = linked(1000, |next| json!({ "$ref": next }));
+        let refused = held_on(SMALL, chain, "\"x\"".into()).expect_err("refused at bind");
+        assert!(refused.contains("512"), "{refused}");
+    }
+
+    #[test]
+    fn a_schema_reevaluating_exponentially_stops_at_its_bound() {
+        // Each schema holds the place to the next twice: 2^40 walks unbounded.
+        let doubling = linked(
+            40,
+            |next| json!({ "allOf": [{ "$ref": next.clone() }, { "$ref": next }] }),
+        );
+        let stopped = held(doubling, "\"x\"".into()).expect("bound, not refused");
+        assert_eq!(codes(&stopped), ["bound"], "{stopped:?}");
+        assert_eq!(stopped[0].path.as_deref(), Some(""));
     }
 
     #[test]
