@@ -24,6 +24,18 @@ spelled only for an issue raised. `date`, `time` and `date-time` are RFC 3339's,
 read by the estate's one calendar, `codec::civil`: the thirty-first of February
 is no date. The TOON contract holds its documents to the same compiled schema.
 
+A schema that would never be done is refused when it is bound (`src/chain.rs`).
+`$ref`, `allOf`, `anyOf`, `oneOf` and `not` hold the same place in the instance
+to another schema; where they come back round without descending, as
+`{"$ref": "#"}` does, the refusal names the `$ref` that closes the cycle, and a
+chain of them longer than 512 schemas is refused too. The compiler works from a
+list, not by recursion, so a long schema is read in the same stack as a short
+one. A check is bounded as well: at most 512 schemas deep, and at most the
+schema's size times the Stream's bytes plus one steps, so a schema that holds one
+place to the same schemas over and over, doubling at each level, stops. Past
+either bound the check ends with one issue coded `bound`, at the place it stopped
+(ADR-0042, amendment 2026-11-19).
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it

@@ -16,6 +16,11 @@
 //! every `$ref` resolved, every `pattern` compiled to its automaton. A
 //! Stream is then held to the tree ([`crate::check`]) without reading the
 //! schema document again.
+//!
+//! The compiler works from a list, never by recursion, and a schema that
+//! would hold one place in the instance to itself for ever, or to too long
+//! a chain, is refused when bound ([`crate::chain`]), so a long schema is
+//! read in the same stack as a short one.
 
 use crate::format::Format;
 use contract::ContractError;
@@ -38,6 +43,31 @@ pub(crate) enum Node {
     /// `false`: admits nothing.
     Nothing,
     Keywords(Box<Keywords>),
+}
+
+impl Node {
+    /// The keywords this node carries, when it carries any.
+    pub(crate) fn keywords(&self) -> Option<&Keywords> {
+        match self {
+            Self::Keywords(keywords) => Some(keywords),
+            Self::Any | Self::Nothing => None,
+        }
+    }
+
+    /// The nodes held to the same place in the instance as this one: its
+    /// `$ref`, `allOf`, `anyOf`, `oneOf` and `not`, followed without
+    /// descending, so they must end, and within [`crate::chain::DEPTH`].
+    pub(crate) fn in_place(&self) -> impl Iterator<Item = usize> + '_ {
+        self.keywords().into_iter().flat_map(|keywords| {
+            keywords
+                .reference()
+                .into_iter()
+                .chain(keywords.all_of.iter().copied())
+                .chain(keywords.any_of.iter().copied())
+                .chain(keywords.one_of.iter().copied())
+                .chain(keywords.not)
+        })
+    }
 }
 
 /// The keywords one schema object carries, each read once.
@@ -71,6 +101,16 @@ pub(crate) struct Keywords {
     pub not: Option<usize>,
 }
 
+impl Keywords {
+    /// The node `$ref` lands on, when it lands.
+    pub(crate) fn reference(&self) -> Option<usize> {
+        self.reference
+            .as_ref()
+            .and_then(|landed| landed.as_ref().ok())
+            .copied()
+    }
+}
+
 /// What `additionalProperties` says of a member `properties` does not name.
 #[derive(Debug, Default)]
 pub(crate) enum Additional {
@@ -87,7 +127,10 @@ impl Schema {
     /// The document must itself be a JSON Schema: an object or a boolean,
     /// whose every `$ref` lands inside it. A reference to another document
     /// is refused, one over a network by name: Xmip fetches nothing a
-    /// schema names (ADR-0045, offline is the default).
+    /// schema names (ADR-0045, offline is the default). So is a schema that
+    /// holds a place in the instance to itself without descending, naming
+    /// the `$ref` that closes the cycle, and one that holds a place to more
+    /// than [`crate::chain::DEPTH`] schemas in a chain.
     pub fn compile(document: &Value) -> Result<Self, ContractError> {
         if !(document.is_object() || document.is_boolean()) {
             return Err(ContractError::new(
@@ -116,9 +159,11 @@ impl Schema {
         let mut compiler = Compiler {
             root: document,
             nodes: Vec::new(),
+            sources: Vec::new(),
             seen: HashMap::new(),
         };
-        compiler.node(document);
+        compiler.all(document);
+        crate::chain::ordered(&compiler.nodes, &compiler.sources)?;
         Ok(Self {
             nodes: compiler.nodes,
             name,
@@ -148,28 +193,41 @@ fn outside(value: &Value) -> Option<String> {
 }
 
 /// Compiles each schema object once, however many `$ref`s reach it, so a
-/// recursive schema is a cycle in the tree rather than an endless one.
+/// recursive schema is a cycle in the tree rather than an endless one; and
+/// from a worklist, one schema after another, never by recursion.
 struct Compiler<'a> {
     root: &'a Value,
     nodes: Vec<Node>,
+    /// The schema each node is compiled from, by id: those past
+    /// `nodes.len()` are still to compile.
+    sources: Vec<&'a Value>,
     seen: HashMap<*const Value, usize>,
 }
 
 impl<'a> Compiler<'a> {
-    fn node(&mut self, schema: &'a Value) -> usize {
-        if let Some(&id) = self.seen.get(&std::ptr::from_ref(schema)) {
-            return id;
+    /// Compiles `document` as node 0, then every schema it reaches.
+    fn all(&mut self, document: &'a Value) {
+        self.node(document);
+        while let Some(&schema) = self.sources.get(self.nodes.len()) {
+            let node = match schema {
+                Value::Bool(false) => Node::Nothing,
+                Value::Object(keywords) => Node::Keywords(Box::new(self.keywords(keywords))),
+                _ => Node::Any,
+            };
+            self.nodes.push(node);
         }
-        let id = self.nodes.len();
-        self.seen.insert(std::ptr::from_ref(schema), id);
-        self.nodes.push(Node::Any);
-        let node = match schema {
-            Value::Bool(false) => Node::Nothing,
-            Value::Object(keywords) => Node::Keywords(Box::new(self.keywords(keywords))),
-            _ => Node::Any,
-        };
-        self.nodes[id] = node;
-        id
+    }
+
+    /// The id of `schema`: the one it has, or the next, compiled in turn.
+    fn node(&mut self, schema: &'a Value) -> usize {
+        let sources = &mut self.sources;
+        *self
+            .seen
+            .entry(std::ptr::from_ref(schema))
+            .or_insert_with(|| {
+                sources.push(schema);
+                sources.len() - 1
+            })
     }
 
     fn keywords(&mut self, keywords: &'a Map<String, Value>) -> Keywords {
