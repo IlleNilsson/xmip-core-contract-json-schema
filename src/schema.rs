@@ -305,8 +305,7 @@ impl<'a> Compiler<'a> {
         keywords
             .get(name)
             .and_then(Value::as_array)
-            .map(|branches| branches.iter().map(|b| self.node(b)).collect())
-            .unwrap_or_default()
+            .map_or_default(|branches| branches.iter().map(|b| self.node(b)).collect())
     }
 }
 

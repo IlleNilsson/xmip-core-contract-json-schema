@@ -264,8 +264,7 @@ mod tests {
         assert_eq!(factory.technology(), "json-schema");
         let bare = factory.load("").expect("bare");
         assert_eq!(bare.descriptor().id.0, "json-schema");
-        let dir = std::env::temp_dir().join("xmip-json-schema-test");
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = file::temporary::Folder::new("json-schema");
         let file = dir.join("order.schema.json");
         std::fs::write(&file, order_schema().to_string()).expect("write schema");
         let bound = factory
