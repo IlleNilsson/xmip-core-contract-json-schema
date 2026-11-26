@@ -11,27 +11,47 @@
 //! The schema dialect is the JSON Schema core and validation vocabulary that
 //! [`schema`] documents; anything outside it is ignored, as the specification
 //! says an unknown keyword must be.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location naming it is configured with and the
+//! name a Validate step names it by, and none of the code above, which is
+//! behind the default feature: what the surfaces' library carries (ADR-0064,
+//! amendment 2026-11-26).
 
+#[cfg(feature = "declaration")]
+pub mod declaration;
+
+#[cfg(feature = "default")]
 pub mod chain;
+#[cfg(feature = "default")]
 pub mod check;
+#[cfg(feature = "default")]
 pub mod format;
+#[cfg(feature = "default")]
 pub mod schema;
 
+#[cfg(feature = "default")]
 use contract::{
     Contract, ContractDescriptor, ContractError, ContractFactory, ContractId, ValidationIssue,
     ValidationResult,
 };
+#[cfg(feature = "default")]
 use schema::Schema;
+#[cfg(feature = "default")]
 use serde_json::Value;
+#[cfg(feature = "default")]
 use stream::Stream;
-use xcore::settings::{Applies, Kind, Presence, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::Settings;
 
 /// The JSON contract, bare or bound to a schema.
+#[cfg(feature = "default")]
 pub struct JsonSchema {
     descriptor: ContractDescriptor,
     schema: Option<Schema>,
 }
 
+#[cfg(feature = "default")]
 impl JsonSchema {
     /// Well-formedness only.
     #[must_use]
@@ -62,12 +82,14 @@ impl JsonSchema {
     }
 }
 
+#[cfg(feature = "default")]
 impl Default for JsonSchema {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "default")]
 fn descriptor(id: &str) -> ContractDescriptor {
     ContractDescriptor {
         id: ContractId(id.to_string()),
@@ -76,6 +98,7 @@ fn descriptor(id: &str) -> ContractDescriptor {
     }
 }
 
+#[cfg(feature = "default")]
 impl Contract for JsonSchema {
     fn descriptor(&self) -> &ContractDescriptor {
         &self.descriptor
@@ -121,11 +144,13 @@ impl Contract for JsonSchema {
     }
 }
 
+#[cfg(feature = "default")]
 fn is_json_media_type(media_type: &str) -> bool {
     let essence = media_type.split(';').next().unwrap_or("").trim();
     essence.eq_ignore_ascii_case("application/json") || essence.ends_with("+json")
 }
 
+#[cfg(feature = "default")]
 fn malformed(error: &serde_json::Error) -> ValidationResult {
     ValidationResult::of(vec![ValidationIssue::at(
         "malformed",
@@ -136,15 +161,17 @@ fn malformed(error: &serde_json::Error) -> ValidationResult {
 
 /// Loads the contract a Location names: an empty reference is the bare
 /// contract, anything else is the path of a schema file.
+#[cfg(feature = "default")]
 pub struct JsonSchemaFactory;
 
+#[cfg(feature = "default")]
 impl ContractFactory for JsonSchemaFactory {
     fn technology(&self) -> &'static str {
-        "json-schema"
+        declaration::NAME
     }
 
     fn settings(&self) -> &'static Settings {
-        SETTINGS
+        declaration::SETTINGS
     }
 
     fn load(&self, reference: &str) -> Result<Box<dyn Contract>, ContractError> {
@@ -161,21 +188,10 @@ impl ContractFactory for JsonSchemaFactory {
     }
 }
 
-/// What a Location gives this contract (ADR-0064, amendment 2026-09-26).
-const SETTINGS: &Settings = &Settings {
-    technology: env!("CARGO_PKG_NAME"),
-    settings: &[Setting {
-        name: "reference",
-        kind: Kind::Address,
-        presence: Presence::Optional,
-        meaning: "The path of the JSON Schema documents are held to; left out, any JSON holds.",
-        applies: Applies::Both,
-    }],
-};
-
 // Declared here and not in `tests`: a path from an inline module passes
 // through a directory named for it that does not exist, which Windows
 // forgives and Linux does not.
+#[cfg(feature = "default")]
 #[cfg(test)]
 #[path = "../tests/measured/order.rs"]
 mod order;
@@ -432,6 +448,8 @@ mod tests {
 
     #[test]
     fn json_schema_declares_its_settings_and_reads_through_them() {
+        use declaration::SETTINGS;
+        use xcore::settings::Applies;
         assert!(SETTINGS.problems().is_empty(), "{:?}", SETTINGS.problems());
         let given = |name: &str, value: &str| {
             (
